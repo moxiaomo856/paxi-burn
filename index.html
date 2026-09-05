@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔥 Paxi链 代币燃烧器</title>
+    <!-- ！！！重点：引入本地SDK和兼容层！！！ -->
+    <script src="./paxi-cosmjs.umd.js"></script>
+    <script src="./compat.js"></script>
+    <style>
+        body { font-family: 'Microsoft YaHei', sans-serif; background: #121212; color: #eee; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .container { background: #1e1e1e; border: 1px solid #333; border-radius: 12px; padding: 30px; width: 90%; max-width: 450px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        h2 { text-align: center; color: #ffd700; margin-bottom: 20px; }
+        label { display: block; margin-bottom: 8px; color: #bbb; }
+        input { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #555; border-radius: 5px; background: #222; color: #fff; font-size: 16px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #ff5722; color: #fff; border: none; border-radius: 5px; font-size: 16px; font-weight: bold; cursor: pointer; }
+        button:hover { background: #e64a19; }
+        button:disabled { background: #666; cursor: not-allowed; }
+        #connectBtn { background: #b8860b; margin-bottom: 20px; }
+        #connectBtn:hover { background: #ffd700; color: #000; }
+        .status { text-align: center; margin-top: 10px; font-size: 14px; }
+        .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #333; color: #fff; padding: 10px 20px; border-radius: 5px; display: none; z-index: 999; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🔥 Paxi 代币燃烧器</h2>
+        <button id="connectBtn" onclick="connectWallet()">🔗 连接钱包</button>
+        
+        <label>代币合约地址 (PRC-20/CW20)</label>
+        <input type="text" id="contractAddr" placeholder="paxi1...">
+
+        <label>燃烧数量（整数）</label>
+        <input type="number" id="burnAmount" placeholder="例如：100">
+
+        <button id="burnBtn" onclick="burnTokens()" disabled>🔥 立即燃烧</button>
+        <div class="status" id="statusText"></div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        // 配置
+        const PAXI_LCD = 'https://mainnet-lcd.paxinet.io';
+        const PAXI_RPC = 'https://mainnet-rpc.paxinet.io';
+        const PAXI_DENOM = 'upaxi';
+        
+        let walletAddress = '';
+        let isProcessing = false;
+
+        // 工具函数：显示提示
+        function showToast(msg, type = 'info') {
+            const toast = document.getElementById('toast');
+            toast.textContent = msg;
+            toast.style.display = 'block';
+            setTimeout(() => { toast.style.display = 'none'; }, 3000);
+        }
+
+        // 连接钱包
+        async function connectWallet() {
+            if (typeof window.paxihub === 'undefined') {
+                showToast('⚠️ 请使用 PaxiHub 钱包打开本页面', 'error');
+                return;
+            }
+            try {
+                const sender = await window.paxihub.paxi.getAddress();
+                walletAddress = sender.address;
+                document.getElementById('connectBtn').textContent = '✅ 已连接: ' + walletAddress.slice(0, 10) + '...';
+                document.getElementById('connectBtn').disabled = true;
+                document.getElementById('burnBtn').disabled = false;
+                showToast('✅ 钱包连接成功！', 'success');
+            } catch (e) {
+                showToast('❌ 连接失败: ' + e.message, 'error');
+            }
+        }
+
+        // 构建并发送交易 (复用你之前的逻辑)
+        function toB64(bytes) {
+            const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+            let binary = '';
+            const chunk = 8192;
+            for (let i = 0; i < arr.length; i += chunk) {
+                binary += String.fromCharCode.apply(null, arr.subarray(i, Math.min(i + chunk, arr.length)));
+            }
+            return btoa(binary);
+        }
+
+        async function buildAndSendTx(messages, memo = "") {
+            const chainId = await fetch(`${PAXI_RPC}/status`).then(r => r.json()).then(d => d.result.node_info.network);
+            const sender = await window.paxihub.paxi.getAddress();
+            const acctRes = await fetch(`${PAXI_LCD}/cosmos/auth/v1beta1/accounts/${sender.address}`);
+            const { account } = await acctRes.json();
+            const ba = account.base_account || account;
+            const accountNumber = Number(ba.account_number);
+            const sequence = Number(ba.sequence);
+
+            const txBody = PaxiCosmJS.TxBody.fromPartial({ messages, memo });
+            const gasLimit = 400000;
+            const feeAmount = Math.ceil(gasLimit * 0.05);
+            const fee = { amount: [PaxiCosmJS.coins(String(feeAmount), PAXI_DENOM)[0]], gasLimit };
+
+            const pubkeyBytes = new Uint8Array(sender.public_key);
+            const pubkeyAny = {
+                typeUrl: "/cosmos.crypto.secp256k1.PubKey",
+                value: PaxiCosmJS.PubKey.encode({ key: pubkeyBytes }).finish()
+            };
+
+            const authInfo = PaxiCosmJS.AuthInfo.fromPartial({
+                signerInfos: [{ publicKey: pubkeyAny, modeInfo: { single: { mode: 1 } }, sequence: BigInt(sequence) }],
+                fee
+            });
+
+            const signDoc = PaxiCosmJS.SignDoc.fromPartial({
+                bodyBytes: PaxiCosmJS.TxBody.encode(txBody).finish(),
+                authInfoBytes: PaxiCosmJS.AuthInfo.encode(authInfo).finish(),
+                chainId,
+                accountNumber: BigInt(accountNumber)
+            });
+
+            const txObj = {
+                bodyBytes: toB64(signDoc.bodyBytes),
+                authInfoBytes: toB64(signDoc.authInfoBytes),
+                chainId,
+                accountNumber: signDoc.accountNumber.toString()
+            };
+
+            const result = await window.paxihub.paxi.signAndSendTransaction(txObj);
+            const sigBytes = Uint8Array.from(atob(result.success), c => c.charCodeAt(0));
+
+            const txRaw = PaxiCosmJS.TxRaw.fromPartial({
+                bodyBytes: signDoc.bodyBytes,
+                authInfoBytes: signDoc.authInfoBytes,
+                signatures: [sigBytes]
+            });
+            const txBytes = PaxiCosmJS.TxRaw.encode(txRaw).finish();
+            const base64Tx = toB64(txBytes);
+
+            const broadcastResult = await fetch(`${PAXI_LCD}/cosmos/tx/v1beta1/txs`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ tx_bytes: base64Tx, mode: "BROADCAST_MODE_SYNC" })
+            }).then(r => r.json());
+
+            const txResp = broadcastResult.tx_response || broadcastResult;
+            if (txResp && txResp.code && txResp.code !== 0) {
+                throw new Error('交易失败: ' + (txResp.raw_log || txResp.code));
+            }
+            return broadcastResult;
+        }
+
+        // 生成 Execute 消息
+        function buildBurnMsg(contractAddr, amountMicro) {
+            const msgObj = { burn: { amount: String(amountMicro) } };
+            const msg = PaxiCosmJS.MsgExecuteContract.fromPartial({
+                sender: walletAddress,
+                contract: contractAddr,
+                msg: new TextEncoder().encode(JSON.stringify(msgObj)),
+                funds: []
+            });
+            return PaxiCosmJS.Any.fromPartial({
+                typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
+                value: PaxiCosmJS.MsgExecuteContract.encode(msg).finish()
+            });
+        }
+
+        // 查询精度
+        async function getTokenDecimals(contractAddr) {
+            const queryObj = JSON.stringify({ token_info: {} });
+            const url = `${PAXI_LCD}/cosmwasm/wasm/v1/contract/${contractAddr}/smart/` + btoa(queryObj);
+            const res = await fetch(url);
+            const data = await res.json();
+            if (data.data && data.data.decimals !== undefined) {
+                return data.data.decimals;
+            }
+            return 6; // 默认 6 位精度
+        }
+
+        // 燃烧主逻辑
+        async function burnTokens() {
+            if (!walletAddress) { showToast('请先连接钱包', 'error'); return; }
+            if (isProcessing) return;
+
+            const contractAddr = document.getElementById('contractAddr').value.trim();
+            const amountInput = document.getElementById('burnAmount').value;
+            
+            if (!contractAddr || !amountInput || Number(amountInput) <= 0) {
+                showToast('请正确填写地址和数量', 'error');
+                return;
+            }
+
+            try {
+                isProcessing = true;
+                document.getElementById('burnBtn').disabled = true;
+                document.getElementById('burnBtn').textContent = '⏳ 查询精度中...';
+
+                // 1. 查询代币精度
+                const decimals = await getTokenDecimals(contractAddr);
+                const amountMicro = Math.floor(Number(amountInput) * Math.pow(10, decimals));
+
+                document.getElementById('burnBtn').textContent = '⏳ 正在签名燃烧...';
+                showToast(`⏳ 准备燃烧 ${amountInput} 个代币（最小单位 ${amountMicro}）`, 'info');
+
+                // 2. 构建消息并发送
+                const msgs = [buildBurnMsg(contractAddr, amountMicro)];
+                await buildAndSendTx(msgs, `Burn ${amountInput} tokens`);
+
+                // 3. 成功提示
+                showToast(`🔥 燃烧成功！全网总量已永久减少！`, 'success');
+                document.getElementById('burnBtn').textContent = '🔥 立即燃烧';
+
+            } catch (e) {
+                console.error(e);
+                showToast('❌ 失败: ' + (e.message || e), 'error');
+                document.getElementById('burnBtn').textContent = '🔥 立即燃烧';
+            } finally {
+                isProcessing = false;
+                document.getElementById('burnBtn').disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
